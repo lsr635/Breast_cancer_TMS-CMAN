@@ -1,314 +1,255 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
-import wandb
-from sklearn.metrics import roc_auc_score, confusion_matrix
 import argparse
 from pathlib import Path
+import os
+from datetime import datetime
+from sklearn.metrics import roc_auc_score, confusion_matrix, accuracy_score
 
-from tms_cman_model import TMS_CMAN, TMS_CMAN_WithSegmentation
+from tms_cman_model import TMS_CMAN
+from dataset import BreastDMDataset
+from torch.utils.data import DataLoader
 
-class AsymmetricLoss(nn.Module):
-    """非对称损失函数，处理类别不平衡"""
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8):
-        super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.clip = clip
-        self.eps = eps
-        
-    def forward(self, x, y):
-        # x: logits, y: targets
-        x_sigmoid = torch.sigmoid(x)
-        xs_pos = x_sigmoid
-        xs_neg = 1 - x_sigmoid
-
-        if self.clip is not None and self.clip > 0:
-            xs_neg = (xs_neg + self.clip).clamp(max=1)
-
-        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
-        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
-        pt0 = xs_pos * y
-        pt1 = xs_neg * (1 - y)
-        pt = pt0 + pt1
-        one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1 - y)
-        one_sided_w = torch.pow(1 - pt, one_sided_gamma)
-        
-        loss = -torch.sum(one_sided_w * (los_pos + los_neg))
-        
-        return loss.mean()
-
-class DCEMRIDataset(torch.utils.data.Dataset):
-    """DCE-MRI数据集"""
-    def __init__(self, data_dir, mode='train', transform=None):
-        self.data_dir = Path(data_dir)
-        self.mode = mode
-        self.transform = transform
-        self.samples = self._load_samples()
-        
-    def _load_samples(self):
-        samples = []
-        return samples
+def train_epoch(model, train_loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
     
-    def __len__(self):
-        return len(self.samples)
+    pbar = tqdm(train_loader, desc='Training')
+    for batch in pbar:
+        frames = batch['frames'].to(device)
+        labels = batch['label'].to(device)
+        subtraction = batch.get('subtraction')
+        if subtraction is not None:
+            subtraction = subtraction.to(device)
+        outputs = model(frames.unsqueeze(2), subtraction) 
+        loss = criterion(outputs['logits'], labels)
+
+        if 'aux_logits' in outputs:
+            aux_loss = criterion(outputs['aux_logits'], labels)
+            loss = loss + 0.3 * aux_loss
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total_loss += loss.item()
+        preds = torch.argmax(outputs['logits'], dim=1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        
+        pbar.set_postfix({'loss': loss.item()})
     
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        frames = []
-        for frame_path in sample['frames']:
-            frame = self._load_frame(frame_path)
-            if self.transform:
-                frame = self.transform(frame)
-            frames.append(frame)
-        
-        frames = torch.stack(frames)  # [T, C, H, W]
-
-        subtraction = None
-        if 'subtraction' in sample:
-            subtraction = self._load_frame(sample['subtraction'])
-            if self.transform:
-                subtraction = self.transform(subtraction)
-        
-        label = sample['label']
-        
-        return {
-            'frames': frames,
-            'subtraction': subtraction,
-            'label': label,
-            'case_id': sample['case_id']
-        }
+    avg_loss = total_loss / len(train_loader)
+    accuracy = accuracy_score(all_labels, all_preds)
     
-    def _load_frame(self, path):
-        pass
+    return avg_loss, accuracy
 
-class Trainer:
-    def __init__(self, model, config):
-        self.model = model
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay
-        )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=config.T_0,
-            T_mult=2,
-            eta_min=config.min_lr
-        )
-        self.criterion_cls = AsymmetricLoss()
-        self.criterion_seg = nn.CrossEntropyLoss()
-
-        if config.use_ema:
-            self.ema = self._create_ema_model()
-
-        self.best_auc = 0
-        self.best_epoch = 0
-        
-    def _create_ema_model(self):
-        ema_model = type(self.model)(self.config).to(self.device)
-        ema_model.load_state_dict(self.model.state_dict())
-        return ema_model
+def validate(model, val_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_probs = []
+    all_labels = []
     
-    def train_epoch(self, train_loader):
-        self.model.train()
-        total_loss = 0
-        predictions = []
-        targets = []
-        
-        pbar = tqdm(train_loader, desc='Training')
-        for batch in pbar:
-            frames = batch['frames'].to(self.device)
-            labels = batch['label'].to(self.device)
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc='Validation'):
+            frames = batch['frames'].to(device)
+            labels = batch['label'].to(device)
             subtraction = batch.get('subtraction')
             if subtraction is not None:
-                subtraction = subtraction.to(self.device)
-            outputs = self.model(frames, subtraction)
-            loss_cls = self.criterion_cls(outputs['logits'], labels)
-            loss_aux = self.criterion_cls(outputs['aux_logits'], labels)
-            loss = loss_cls + 0.3 * loss_aux
- 
-            if 'seg_logits' in outputs:
-                seg_targets = batch.get('seg_mask')
-                if seg_targets is not None:
-                    seg_targets = seg_targets.to(self.device)
-                    loss_seg = self.criterion_seg(outputs['seg_logits'], seg_targets)
-                    loss = loss + 0.5 * loss_seg
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-
-            if hasattr(self, 'ema'):
-                self._update_ema()
-
+                subtraction = subtraction.to(device)
+            
+            outputs = model(frames.unsqueeze(2), subtraction)
+            loss = criterion(outputs['logits'], labels)
             total_loss += loss.item()
-            predictions.extend(torch.sigmoid(outputs['logits']).cpu().numpy())
-            targets.extend(labels.cpu().numpy())
-            pbar.set_postfix({'loss': loss.item()})
-
-        avg_loss = total_loss / len(train_loader)
-        auc = roc_auc_score(targets, predictions)
-        
-        return avg_loss, auc
+            probs = torch.softmax(outputs['logits'], dim=1)
+            preds = torch.argmax(outputs['logits'], dim=1)
+            all_probs.extend(probs[:, 1].cpu().numpy())  
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
-    def validate(self, val_loader):
-        model = self.ema if hasattr(self, 'ema') else self.model
-        model.eval()
-        
-        total_loss = 0
-        predictions = []
-        targets = []
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Validation'):
-                frames = batch['frames'].to(self.device)
-                labels = batch['label'].to(self.device)
-                subtraction = batch.get('subtraction')
-                if subtraction is not None:
-                    subtraction = subtraction.to(self.device)
-
-                logits_list = []
-                for aug in range(self.config.tta_num):
-                    aug_frames = self._apply_tta(frames, aug)
-                    outputs = model(aug_frames, subtraction)
-                    logits_list.append(outputs['logits'])
-
-                logits = torch.stack(logits_list).mean(dim=0)
-                loss = self.criterion_cls(logits, labels)
-                total_loss += loss.item()
-                predictions.extend(torch.sigmoid(logits).cpu().numpy())
-                targets.extend(labels.cpu().numpy())
-
-        avg_loss = total_loss / len(val_loader)
-        auc = roc_auc_score(targets, predictions)
-        predictions_binary = (np.array(predictions) > 0.5).astype(int)
-        cm = confusion_matrix(targets, predictions_binary)
-        
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        
-        metrics = {
-            'loss': avg_loss,
-            'auc': auc,
-            'sensitivity': sensitivity,
-            'specificity': specificity
-        }
-        
-        return metrics
+    avg_loss = total_loss / len(val_loader)
+    accuracy = accuracy_score(all_labels, all_preds)
+    auc = roc_auc_score(all_labels, all_probs)
     
-    def _apply_tta(self, x, aug_idx):
-        """测试时增强"""
-        if aug_idx == 0:
-            return x
-        elif aug_idx == 1:
-            return torch.flip(x, dims=[-1])  
-        elif aug_idx == 2:
-            return torch.flip(x, dims=[-2])
-        else:
-            return x
+    cm = confusion_matrix(all_labels, all_preds)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    else:
+        sensitivity = specificity = 0
     
-    def _update_ema(self, decay=0.999):
-        """更新EMA模型"""
-        with torch.no_grad():
-            for ema_param, model_param in zip(self.ema.parameters(), self.model.parameters()):
-                ema_param.data.mul_(decay).add_(model_param.data, alpha=1 - decay)
-    
-    def train(self, train_loader, val_loader, num_epochs):
-        for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            train_loss, train_auc = self.train_epoch(train_loader)
-            val_metrics = self.validate(val_loader)
-            self.scheduler.step()
-
-            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            print(f"Val Loss: {val_metrics['loss']:.4f}, Val AUC: {val_metrics['auc']:.4f}")
-            print(f"Sensitivity: {val_metrics['sensitivity']:.4f}, Specificity: {val_metrics['specificity']:.4f}")
-
-            if val_metrics['auc'] > self.best_auc:
-                self.best_auc = val_metrics['auc']
-                self.best_epoch = epoch
-                self.save_checkpoint(f'best_model_epoch_{epoch}.pth')
-
-            if self.config.use_wandb:
-                wandb.log({
-                    'train_loss': train_loss,
-                    'train_auc': train_auc,
-                    'val_loss': val_metrics['loss'],
-                    'val_auc': val_metrics['auc'],
-                    'sensitivity': val_metrics['sensitivity'],
-                    'specificity': val_metrics['specificity'],
-                    'lr': self.optimizer.param_groups[0]['lr']
-                })
-    
-    def save_checkpoint(self, filename):
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'ema_state_dict': self.ema.state_dict() if hasattr(self, 'ema') else None,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_auc': self.best_auc,
-            'best_epoch': self.best_epoch
-        }, filename)
+    return avg_loss, accuracy, auc, sensitivity, specificity
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=100)
+    parser = argparse.ArgumentParser(description='Train TMS-CMAN on BreastDM Dataset')
+    parser.add_argument('--data_dir', type=str, required=True,
+                       help='Path to dataset directory (dataset_exp_1 or dataset_exp_2)')
+    parser.add_argument('--dataset_type', type=str, choices=['exp_1', 'exp_2'], required=True,
+                       help='Dataset type: exp_1 (no subtraction) or exp_2 (with subtraction)')
+    parser.add_argument('--img_size', type=int, default=96,
+                       help='Image size (default: 96)')
+    parser.add_argument('--model_type', type=str, default='simple',
+                       choices=['simple', 'full'], help='Model complexity')
+
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=1e-2)
-    parser.add_argument('--use_ema', action='store_true')
-    parser.add_argument('--use_wandb', action='store_true')
-    parser.add_argument('--tta_num', type=int, default=3)
-    parser.add_argument('--T_0', type=int, default=10)
-    parser.add_argument('--min_lr', type=float, default=1e-6)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--num_workers', type=int, default=4)
+
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--gpu', type=str, default='0')
+    args = parser.parse_args()
     
-    config = parser.parse_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    if config.use_wandb:
-        wandb.init(project='tms-cman', config=config)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
 
-    model = TMS_CMAN(
-        num_classes=2,
-        num_frames=9,
-        use_subtraction=True,
-        pretrained=True
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_dir = Path(args.save_dir) / f"{args.dataset_type}_{timestamp}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"Save directory: {save_dir}")
+
+    print("Loading datasets...")
+    train_dataset = BreastDMDataset(
+        root_dir=args.data_dir,
+        mode='train',
+        img_size=args.img_size,
+        dataset_type=args.dataset_type,
+        augmentation=True
     )
     
-    # 如果需要多任务学习
-    # model = TMS_CMAN_WithSegmentation(model)
+    val_dataset = BreastDMDataset(
+        root_dir=args.data_dir,
+        mode='val',
+        img_size=args.img_size,
+        dataset_type=args.dataset_type,
+        augmentation=False
+    )
     
-    model = model.cuda()
-    train_dataset = DCEMRIDataset(config.data_dir, mode='train')
-    val_dataset = DCEMRIDataset(config.data_dir, mode='val')
+    test_dataset = BreastDMDataset(
+        root_dir=args.data_dir,
+        mode='test',
+        img_size=args.img_size,
+        dataset_type=args.dataset_type,
+        augmentation=False
+    )
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True
     )
+    
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True
     )
-    trainer = Trainer(model, config)
-    trainer.train(train_loader, val_loader, config.num_epochs)
     
-    print(f"\nTraining completed!")
-    print(f"Best AUC: {trainer.best_auc:.4f} at epoch {trainer.best_epoch}")
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Val samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
+
+    print("Creating model...")
+    if args.model_type == 'simple':
+        model = TMS_CMAN(
+            num_classes=2,
+            num_frames=9,
+            cnn_backbone='resnet50',  
+            transformer_backbone='vit_tiny_patch16_224',
+            use_subtraction=(args.dataset_type == 'exp_2'),
+            pretrained=True
+        )
+    else:
+        model = TMS_CMAN(
+            num_classes=2,
+            num_frames=9,
+            cnn_backbone='convnext_tiny',
+            transformer_backbone='swin_tiny_patch4_window7_224',
+            use_subtraction=(args.dataset_type == 'exp_2'),
+            pretrained=True
+        )
+    
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+    best_auc = 0
+    best_epoch = 0
+    
+    print("\nStarting training...")
+    print("="*50)
+    
+    for epoch in range(1, args.num_epochs + 1):
+        print(f"\nEpoch {epoch}/{args.num_epochs}")
+        print("-"*30)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc, val_auc, val_sens, val_spec = validate(model, val_loader, criterion, device)
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        print(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
+        print(f"        Sensitivity: {val_sens:.4f}, Specificity: {val_spec:.4f}")
+        print(f"Learning Rate: {current_lr:.6f}")
+
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_epoch = epoch
+            
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_auc': best_auc,
+                'args': args
+            }
+            
+            torch.save(checkpoint, save_dir / 'best_model.pth')
+            print(f"✓ Saved best model (AUC: {best_auc:.4f})")
+    
+    print("\n" + "="*50)
+    print("Training completed!")
+    print(f"Best AUC: {best_auc:.4f} at epoch {best_epoch}")
+    
+    print("\nEvaluating on test set...")
+    model.load_state_dict(torch.load(save_dir / 'best_model.pth')['model_state_dict'])
+    test_loss, test_acc, test_auc, test_sens, test_spec = validate(model, test_loader, criterion, device)
+    
+    print(f"Test Results:")
+    print(f"  Accuracy: {test_acc:.4f}")
+    print(f"  AUC: {test_auc:.4f}")
+    print(f"  Sensitivity: {test_sens:.4f}")
+    print(f"  Specificity: {test_spec:.4f}")
 
 if __name__ == '__main__':
     main()
