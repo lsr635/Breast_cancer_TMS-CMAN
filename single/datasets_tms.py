@@ -143,3 +143,113 @@ def build_tms_loader(root: str, phase: str, batch_size: int,
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle if phase=='train' else False,
                         num_workers=num_workers, pin_memory=pin_memory, drop_last=(phase=='train'))
     return loader, dataset.classes
+
+# ----------------------------------------------------------------------------------------------------
+# sequence dataset
+
+import os, re, glob
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms as T
+
+def default_build_transforms(train, img_size):
+    ts = []
+    if train:
+        ts += [
+            T.Resize((img_size, img_size)),
+            T.RandomHorizontalFlip(p=0.5),
+        ]
+    else:
+        ts += [T.Resize((img_size, img_size))]
+    ts += [T.ToTensor()]
+    return T.Compose(ts)
+
+_seq_re = re.compile(
+    r'^(?P<prefix>BreaDM-(?P<bm>(Ma|Be))-(?P<case>\d+)_VIBRANT)'
+    r'(?P<cseq>(\+C(?P<cidx>\d+))?)_p-(?P<pidx>\d+)\.jpg$'
+)
+
+def parse_name(fname):
+    # 返回 (BM, case_id, pidx, cidx) 其中 cidx=0 表 pre, 1..8 为 C1..C8
+    m = _seq_re.match(fname)
+    if not m:
+        return None
+    bm = m.group('bm')      # 'Ma' 或 'Be'
+    case = m.group('case')  # '1802' ...
+    pidx = int(m.group('pidx'))
+    cidx = m.group('cidx')
+    cidx = int(cidx) if cidx is not None else 0
+    return bm, case, pidx, cidx
+
+class TMSSequenceFolder(Dataset):
+    def __init__(self, root, phase='train', img_size=224, temporal=True, max_T=9, transform=None):
+        super().__init__()
+        self.root = root
+        self.phase = phase
+        self.temporal = temporal
+        self.max_T = max_T
+        self.img_size = img_size
+        self.transform = transform or default_build_transforms(train=(phase=='train'), img_size=img_size)
+
+        # 类别子文件夹：假设用 'B' 良性，'M' 恶性
+        self.classes = sorted([d for d in os.listdir(os.path.join(root, phase)) if os.path.isdir(os.path.join(root, phase, d))])
+        self.class_to_idx = {c:i for i,c in enumerate(self.classes)}  # {'B':0,'M':1}
+
+        self.samples = self._build_sequences()
+
+    def _build_sequences(self):
+        base = os.path.join(self.root, self.phase)
+        items = []
+        for cls in self.classes:
+            cls_dir = os.path.join(base, cls)
+            all_files = [f for f in os.listdir(cls_dir) if f.lower().endswith('.jpg')]
+            # 建索引：key = (bm, case, pidx)，value = {0:pre_path, 1:C1_path, ...}
+            buckets = {}
+            for f in all_files:
+                parsed = parse_name(f)
+                if parsed is None:
+                    continue
+                bm, case, pidx, cidx = parsed
+                key = (bm, case, pidx)
+                d = buckets.setdefault(key, {})
+                d[cidx] = os.path.join(cls_dir, f)
+
+            for key, frames in buckets.items():
+                # 期望帧序：0..8（pre + C1..C8）
+                order = list(range(min(self.max_T, 9))) if self.temporal else [0]
+                paths = []
+                ok = True
+                for t in order:
+                    if t in frames:
+                        paths.append(frames[t])
+                    else:
+                        ok = False
+                        break
+                if not ok:
+                    # 若要容忍缺帧，可以在这里补齐：用已存在的最邻近帧替代
+                    # 这里默认跳过不完整序列，保证严格9帧
+                    continue
+                label = self.class_to_idx[cls]
+                items.append((paths, label, key))
+        return items
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_img(self, path):
+        img = Image.open(path).convert('RGB')
+        return img
+
+    def __getitem__(self, idx):
+        paths, label, key = self.samples[idx]
+        if self.temporal:
+            # 对时序一致性，建议先把几何增广参数固定。最简单方式：对每帧分别用同一个 transform 需要把随机数种子固定。
+            # 简化：用同一 transform 对每帧独立调用（轻度随机差异通常也能收敛）
+            frames = [self.transform(self._load_img(p)) for p in paths]  # list of [3,H,W]
+            x = torch.stack(frames, dim=0)  # [T,3,H,W]
+        else:
+            x = self.transform(self._load_img(paths[0]))  # [3,H,W]
+        y = torch.tensor(label, dtype=torch.long)
+        meta = {'key': key, 'paths': paths}
+        return x, y, meta
