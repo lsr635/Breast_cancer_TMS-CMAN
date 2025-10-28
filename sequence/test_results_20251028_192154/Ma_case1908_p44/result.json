@@ -1,0 +1,29 @@
+{
+  "case_id": "Ma_case1908_p44",
+  "frame_paths": [
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C1_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C2_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C3_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C4_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C5_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C6_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C7_p-044.jpg",
+    "/root/autodl-tmp/class_dataset_exp_1/test/M/BreaDM-Ma-1908_VIBRANT+C8_p-044.jpg"
+  ],
+  "ground_truth": {
+    "index": 1,
+    "label": "M"
+  },
+  "prediction": {
+    "index": 0,
+    "label": "B",
+    "probabilities": [
+      0.7733718156814575,
+      0.22662819921970367
+    ],
+    "positive_score": 0.22662819921970367,
+    "threshold": null
+  },
+  "is_correct": false
+}
