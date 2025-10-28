@@ -110,8 +110,34 @@ class ModelEMA:
         for k, v in self.ema.state_dict().items():
             v.copy_(v * d + msd[k] * (1.0 - d))
 
+def auc_pairwise_loss(scores: torch.Tensor, labels: torch.Tensor, max_pairs: int = 4096) -> torch.Tensor:
+    """
+    简化的 AUC 代理损失：对 (pos, neg) 成对使用 log(1 + exp(-(s_pos - s_neg)))。
+    为控制复杂度，限制最多 max_pairs 对。
+    scores: [B]，建议取类别1的logit或概率
+    labels: [B]，0/1
+    """
+    with torch.no_grad():
+        pos_idx = torch.nonzero(labels == 1, as_tuple=False).flatten()
+        neg_idx = torch.nonzero(labels == 0, as_tuple=False).flatten()
+    P = pos_idx.numel(); N = neg_idx.numel()
+    if P == 0 or N == 0:
+        return scores.new_zeros(())
+    # 采样子集以满足对数约束
+    k_pos = min(P, int(max(1, math.sqrt(max_pairs))))
+    k_neg = min(N, max(1, max_pairs // max(1, k_pos)))
+    # 随机采样索引
+    pos_sel = pos_idx[torch.randperm(P, device=scores.device)[:k_pos]]
+    neg_sel = neg_idx[torch.randperm(N, device=scores.device)[:k_neg]]
+    s_pos = scores[pos_sel]  # [k_pos]
+    s_neg = scores[neg_sel]  # [k_neg]
+    diff = s_pos.view(-1,1) - s_neg.view(1,-1)
+    # log(1+exp(-d)) = softplus(-d)
+    loss = F.softplus(-diff).mean()
+    return loss
+
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes=2, tta=False):
+def evaluate(model, loader, device, num_classes=2, tta=False, tta_mode='flip2'):
     model.eval()
     total=0; correct=0; losses=[]
     all_probs=[]; all_labels=[]
@@ -124,9 +150,17 @@ def evaluate(model, loader, device, num_classes=2, tta=False):
             loss = ce_eval(logits, labels)
             probs = torch.softmax(logits, dim=1)
         else:
-            logits1 = model(data)
-            logits2 = model(torch.flip(data, dims=[-1]))
-            logits = (logits1 + logits2) / 2.0
+            if tta_mode == 'flip4':
+                logits_list = []
+                logits_list.append(model(data))
+                logits_list.append(model(torch.flip(data, dims=[-1])))               # hflip
+                logits_list.append(model(torch.flip(data, dims=[-2])))               # vflip（可选）
+                logits_list.append(model(torch.flip(torch.flip(data, dims=[-1]), dims=[-2])))  # hvflip
+                logits = sum(logits_list) / float(len(logits_list))
+            else:  # 'flip2'（默认）
+                logits1 = model(data)
+                logits2 = model(torch.flip(data, dims=[-1]))
+                logits = (logits1 + logits2) / 2.0
             loss = ce_eval(logits, labels)
             probs = torch.softmax(logits, dim=1)
         pred = probs.argmax(dim=1)
@@ -380,13 +414,24 @@ def main():
     parser.add_argument('--amp', type=int, default=1)
     parser.add_argument('--clip', type=float, default=0.5)
 
+    # 难例定向：错误样本目录、采样权重与强增强
+    parser.add_argument('--hard-dir', type=str, default='', help='错误样本目录（例如 error_collection），用于难例采样/增强')
+    parser.add_argument('--hard-weight', type=float, default=1.0, help='命中难例时的采样权重倍率（>1更关注，=1不启用）')
+    parser.add_argument('--hard-aug', type=int, default=0, help='对难例启用更强数据增强（1/0）')
+
     # 增强
     parser.add_argument('--mixup', type=int, default=1)
     parser.add_argument('--cutmix', type=int, default=1)
     parser.add_argument('--mix_alpha', type=float, default=0.5)
 
+    # AUC排序正则（可选）
+    parser.add_argument('--use_auc_pair', type=int, default=0, help='是否启用pairwise AUC正则(0/1)')
+    parser.add_argument('--auc_pair_weight', type=float, default=0.1, help='AUC正则权重')
+    parser.add_argument('--auc_pair_max_pairs', type=int, default=4096, help='每批最多采样的正负对数量上限')
+
     # 推理增强/TTA 与 SWA
     parser.add_argument('--tta', type=int, default=1)
+    parser.add_argument('--tta-mode', type=str, default='flip2', choices=['flip2','flip4'])
     parser.add_argument('--swa', type=int, default=1)
     parser.add_argument('--swa_start_ratio', type=float, default=0.7)
 
@@ -397,6 +442,33 @@ def main():
     parser.add_argument('--thr-step', type=float, default=0.001)
     parser.add_argument('--target-sens', type=float, default=0.85)
     args = parser.parse_args()
+    # ---------- 读取难例 keys ----------
+    def load_hard_keys(hard_dir: str):
+        """
+        从错误样本目录读取难例键集合，目录名形如：Be_case1822_p35 / Ma_case1908_p42
+        返回集合：{('Be','1822',35), ...}
+        """
+        hard_set = set()
+        if not hard_dir or not os.path.isdir(hard_dir):
+            return hard_set
+        import re
+        pat = re.compile(r'^(?P<bm>Be|Ma)_case(?P<case>\d+)_p(?P<pidx>\d+)$', re.I)
+        for name in os.listdir(hard_dir):
+            m = pat.match(name)
+            if not m:
+                continue
+            bm = 'Be' if m.group('bm').lower()=='be' else 'Ma'
+            case = m.group('case')
+            pidx = int(m.group('pidx'))
+            hard_set.add((bm, case, pidx))
+        return hard_set
+
+    hard_keys = load_hard_keys(args.hard_dir)
+    if len(hard_keys) > 0:
+        print(f'[INFO] Loaded hard keys: {len(hard_keys)} from {args.hard_dir}')
+    else:
+        if args.hard_dir:
+            print(f'[WARN] No hard keys found from: {args.hard_dir}')
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -412,7 +484,9 @@ def main():
     train_dataset = TMSImageFolder(root=args.path, phase='train', img_size=args.img_size,
                                    temporal=bool(args.temporal), max_T=args.T,
                                    transform=build_transforms(train=True, img_size=args.img_size),
-                                   seq_source=seq_source, enable_aug=True)
+                                   seq_source=seq_source, enable_aug=True,
+                                   hard_keys=hard_keys if len(hard_keys)>0 else None,
+                                   hard_strong_aug=bool(args.hard_aug))
     val_dataset = TMSImageFolder(root=args.path, phase='val', img_size=args.img_size,
                                  temporal=bool(args.temporal), max_T=args.T,
                                  transform=build_transforms(train=False, img_size=args.img_size),
@@ -423,14 +497,28 @@ def main():
                                   seq_source=seq_source, enable_aug=False)
 
     # WeightedRandomSampler：按类反频率采样
-    tmp_for_weights = DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=0)
-    train_labels_list = []
-    for _, ys, _ in tmp_for_weights:
-        train_labels_list.extend(ys.numpy().tolist())
+    # 基于数据集样本顺序构建采样权重：类反频率 × 难例倍率
+    train_labels_list = [lbl for (_, lbl, _) in train_dataset.samples]
+    train_keys_list = [key for (_, _, key) in train_dataset.samples]
     class_counts = Counter(train_labels_list)
     num_samples = len(train_labels_list)
     class_weight_map = {c: num_samples / (len(class_counts) * cnt) for c, cnt in class_counts.items()}
-    sample_weights = np.array([class_weight_map[y] for y in train_labels_list], dtype=np.float64)
+    hard_w = float(args.hard_weight) if args.hard_weight is not None else 1.0
+    if hard_w < 1.0:
+        hard_w = 1.0
+    sample_weights = []
+    hard_matched = 0
+    if len(hard_keys) > 0 and hard_w > 1.0:
+        for y, k in zip(train_labels_list, train_keys_list):
+            w = class_weight_map[y]
+            if k in hard_keys:
+                w *= hard_w
+                hard_matched += 1
+            sample_weights.append(w)
+    else:
+        sample_weights = [class_weight_map[y] for y in train_labels_list]
+    print(f'[INFO] Hard matched in train set: {hard_matched} / {len(train_labels_list)} (hard_weight={hard_w})')
+    sample_weights = np.asarray(sample_weights, dtype=np.float64)
     sampler = WeightedRandomSampler(weights=torch.from_numpy(sample_weights),
                                     num_samples=len(train_dataset), replacement=True)
 
@@ -573,6 +661,11 @@ def main():
                         else:
                             logits = model(data)
                             loss = criterion(logits, labels)
+                            # AUC排序正则（避免与MixUp/CutMix同时使用）
+                            if bool(args.use_auc_pair):
+                                scores = logits[:,1]
+                                loss_auc = auc_pairwise_loss(scores, labels, max_pairs=int(args.auc_pair_max_pairs))
+                                loss = loss + float(args.auc_pair_weight) * loss_auc
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip)
@@ -586,6 +679,10 @@ def main():
                     else:
                         logits = model(data)
                         loss = criterion(logits, labels)
+                        if bool(args.use_auc_pair):
+                            scores = logits[:,1]
+                            loss_auc = auc_pairwise_loss(scores, labels, max_pairs=int(args.auc_pair_max_pairs))
+                            loss = loss + float(args.auc_pair_weight) * loss_auc
                     loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip)
                     optimizer.step()
@@ -606,7 +703,7 @@ def main():
 
             # 验证 + 阈值扫描
             eval_model = ema.ema if ema is not None else model
-            val_acc, val_loss, val_auc, sens, spec, cm, y_val, s_val = evaluate(eval_model, val_loader, device, num_classes=args.num_classes, tta=bool(args.tta))
+            val_acc, val_loss, val_auc, sens, spec, cm, y_val, s_val = evaluate(eval_model, val_loader, device, num_classes=args.num_classes, tta=bool(args.tta), tta_mode=args.tta_mode)
             best_on_val = sweep_threshold(y_val, s_val, step=args.thr_step)
             best_thr = best_on_val['thr']
             print(f'[VAL-THR] best_thr={best_thr:.3f} | J={best_on_val["J"]:.4f} | acc={best_on_val["acc"]:.2f}% sens={best_on_val["sens"]:.4f} spec={best_on_val["spec"]:.4f}')
@@ -718,7 +815,7 @@ def main():
             print('[WARN] Failed to load saved threshold:', e)
 
     # 最终测试（使用 EMA/SWA 模型；阈值采用验证集 best_thr）
-    te_acc_05, te_loss, te_auc, te_sens_05, te_spec_05, cm_05, y_test, s_test = evaluate(eval_model, test_loader, device, num_classes=args.num_classes, tta=bool(args.tta))
+    te_acc_05, te_loss, te_auc, te_sens_05, te_spec_05, cm_05, y_test, s_test = evaluate(eval_model, test_loader, device, num_classes=args.num_classes, tta=bool(args.tta), tta_mode=args.tta_mode)
     te_acc_thr, te_sens_thr, te_spec_thr, cm_thr = cls_metrics_from_scores(y_test, s_test, best_thr)
 
     print('Test | (thr=0.5)  Loss:{:.4f} Acc:{:.2f}% AUC:{:.4f} Sens:{:.4f} Spec:{:.4f}'.format(te_loss, te_acc_05, te_auc, te_sens_05, te_spec_05))

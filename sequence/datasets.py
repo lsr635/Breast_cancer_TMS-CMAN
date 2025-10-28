@@ -184,7 +184,8 @@ class TemporalConsistentRandomErasing:
 class TMSSequenceFolder(Dataset):
     def __init__(self, root, phase='train', img_size=224, temporal=True, max_T=9,
                  transform=None, seq_source='exp1_vibrant',
-                 enable_aug=True):
+                 enable_aug=True,
+                 hard_keys=None, hard_strong_aug=False):
         """
         seq_source:
           - 'exp1_vibrant'  : [pre, C1..C8] (T=9)
@@ -210,6 +211,18 @@ class TMSSequenceFolder(Dataset):
             do_bcj=True, brightness=0.12, contrast=0.12, p_bcj=0.5,
             do_gaussian=True, gauss_std=0.01, p_gaussian=0.3,
             do_blur=False, blur_radius=0.6, p_blur=0.2,
+            img_size=img_size
+        )
+        # 针对难例的更强增强（可选）
+        self.hard_keys = set(hard_keys) if hard_keys is not None else set()
+        self.hard_strong_aug = bool(hard_strong_aug)
+        self.temporal_aug_hard = TemporalAugment(
+            do_hflip=True, p_hflip=0.6,
+            do_affine=True, degrees=18.0, translate=0.08, scale=(0.9, 1.12), shear=8.0, p_affine=0.8,
+            do_crop=True, crop_ratio=(0.82, 1.0), p_crop=0.9,
+            do_bcj=True, brightness=0.18, contrast=0.18, p_bcj=0.6,
+            do_gaussian=True, gauss_std=0.015, p_gaussian=0.4,
+            do_blur=False, blur_radius=0.8, p_blur=0.25,
             img_size=img_size
         )
         self.t_erase = TemporalConsistentRandomErasing(p=0.25, area=(0.02, 0.05), aspect=(0.5, 2.0), value=0.0)
@@ -327,7 +340,11 @@ class TMSSequenceFolder(Dataset):
             x = torch.stack(frames, dim=0)  # [T,3,H,W]
             # 时序一致随机增强（仅训练阶段）
             if self.enable_aug:
-                x = self.temporal_aug(x)
+                # 难例使用更强增强（可选）
+                if self.hard_strong_aug and key in self.hard_keys:
+                    x = self.temporal_aug_hard(x)
+                else:
+                    x = self.temporal_aug(x)
                 x = self.t_erase(x)
         else:
             x = self.transform(self._load_img(paths[0]))  # [3,H,W]
